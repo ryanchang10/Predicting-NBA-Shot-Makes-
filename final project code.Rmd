@@ -1,0 +1,367 @@
+---
+title: "Final Project"
+output: pdf_document
+date: "2024-05-16"
+author: Ryan Chang
+---
+
+
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(collapse=TRUE, prompt=TRUE,comment=NULL,message=FALSE, include=TRUE, warning = FALSE)
+library(tidyverse)
+library(tidymodels)
+library(ggplot2)
+library(readr)
+library(ggthemes)
+theme_set(theme_stata(base_size = 10))  # for nice looking plots
+library(rvest)
+library(tidytext)
+library(tidyr)
+library(purrr)
+library(polite)
+library(tidytext)
+library(plotly)
+library(stringr)
+library(shiny)
+library(ggfittext)
+library(plotly)
+library(DT)
+library(broom)
+library(bslib)
+library(shinythemes)
+```
+
+
+```{r}
+# Loading in the datasets
+# taken from kaggle: https://www.kaggle.com/datasets/dansbecker/nba-shot-logs/data
+shot_logs <- read_csv("shot_logs.csv")
+```
+
+
+```{r}
+# Top 20 players, according to ESPN
+top_20 <- c("russel westbrook", "anthony davis", "james harden", "demarcus cousins", "lebron james", "stephen curry", "kevin durant", "chris paul", "blake griffin", "lamarcus aldridge", "pau gasol", "john wall", "carmelo anthony", "nikola vucevic", "damian lillard", "kyrie irving", "rudy gay", "marc gasol", "kobe bryant", "jimmy butler")
+
+# clean/wrangle data
+shot_data <- shot_logs %>% 
+  filter(player_name %in% top_20) %>% 
+  janitor::clean_names() %>% 
+  rename(player = player_name) %>% 
+  rename(shot_type = pts_type) %>% 
+  rename(def_dist = close_def_dist) %>% 
+  mutate(location = +(location == "A")) %>% #Recode location variable to equal 1 if away, 0 if home 
+  mutate(shot_result = as.factor(shot_result)) %>% 
+  drop_na()
+```
+
+
+```{r}
+# Creating workflow for knn
+set.seed(12345)
+shot_raw <- shot_data %>% 
+  select(location, shot_number, period, shot_clock, dribbles, touch_time, shot_dist, shot_type, def_dist, shot_result)
+
+
+# split data
+shot_split <- initial_split(shot_raw, prop = 0.75)
+shot_train <- shot_split %>% training()
+shot_test <- shot_split %>% testing()
+
+
+# create recipe
+shot_recipe <- recipe(shot_result ~ ., data = shot_raw) %>% 
+  step_scale(all_predictors()) %>% 
+  step_center(all_predictors())
+
+
+# specify model
+shot_knn_spec <- nearest_neighbor(mode = "classification", 
+                                  engine = "kknn", 
+                                  weight_func = "rectangular", 
+                                  neighbors = 40)
+
+# define workflow object
+shot_workflow <- workflow() %>% 
+  add_recipe(shot_recipe) %>% 
+  add_model(shot_knn_spec)
+
+
+# fit the model
+shot_fit <- fit(shot_workflow, data = shot_train)
+
+
+# testing the model on test dataset
+test_features <- shot_test %>% select(location, shot_number, period, shot_clock, dribbles, touch_time, shot_dist, shot_type, def_dist) 
+shot_pred <- predict(shot_fit, test_features, type = "raw")
+shot_results <- shot_test %>% 
+  select(shot_result) %>% 
+  bind_cols(predicted = shot_pred)
+
+
+
+conf_mat(shot_results, truth = shot_result, estimate = predicted) %>%
+  autoplot()
+
+
+# Retrieving the metrics
+custom_metrics <- metric_set(accuracy, sens, spec, ppv) # select custom metrics
+shot_results$shot_result <- as.factor(shot_results$shot_result)
+metrics <- custom_metrics(shot_results, truth = shot_result, estimate = predicted) 
+
+metrics
+```
+
+
+```{r}
+# Running again to find the optimal k value
+
+knn_spec <- nearest_neighbor(mode = "classification",
+                             engine = "kknn",
+                             weight_func = "rectangular", 
+                             neighbors = tune())
+
+shot_vfold <- vfold_cv(sample_frac(shot_train, 0.2, replace = FALSE), v = 2, strata = shot_result, repeats = 10)
+
+k_vals <- tibble(neighbors = seq(from = 1, to = 40, by = 1))
+
+knn_fit <- workflow() %>% 
+  add_recipe(shot_recipe) %>% 
+  add_model(knn_spec) %>% 
+  tune_grid(resamples = shot_vfold,
+            grid = k_vals,
+            metrics = metric_set(accuracy, sensitivity, specificity, ppv))
+
+cv_metrics <- collect_metrics(knn_fit)
+cv_metrics %>% head(6)
+
+cv_metrics %>% 
+  group_by(.metric) %>% 
+  mutate(.metric = as.factor(.metric)) %>%
+  select(neighbors, .metric, mean) %>% 
+  ggplot(aes(x = neighbors, y = mean, color = forcats::fct_reorder2(.metric, neighbors, mean))) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  theme_minimal() +
+  scale_color_wsj() + 
+  scale_x_continuous(breaks = k_vals[[1]]) +
+  theme(panel.grid.minor.x = element_blank())+
+  labs(color='Metric', y = "Estimate", x = "K")
+
+
+# From this plot, I choose k = 40. Specificity is the most desired metric here because if I correctly predict more missed shots, I can relay that information to the team so they know to pass the ball in those situations. 
+```
+
+```{r}
+library(yardstick)
+shot_prob <- predict(shot_fit, test_features, type = "prob")
+shot_results2 <- shot_test %>% select(shot_result) %>% bind_cols(shot_prob)
+shot_results2 %>%
+  roc_curve(truth = shot_result, .pred_made) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity)) +
+  geom_line(color = "#1f77b4", size = 1.2) +
+  geom_abline(linetype = "dashed", color = "gray") +
+  annotate("text", x = 0.8, y = 0.1, label = paste("AUC =", round(roc_auc(shot_results2, truth = shot_result, .pred_made)$.estimate, 3)), hjust = 1, color = "#ff7f0e", size = 5, fontface = "bold") +
+  labs(title = "ROC Curve", subtitle = "Performance of Shot Prediction Model", x = "False Positive Rate (1 - specificity)", y = "True Positive Rate (sensitivity)") +
+  theme_minimal() 
+```
+
+
+
+
+```{r}
+# Shiny App Code: 
+
+# UI: 
+
+ui <- page_navbar(
+  theme = shinytheme("cyborg"),
+  # Create different pages within the app for introduction, plots (EDA), knn analysis, and analysis/discussion
+  title = "Final Project App",
+  inverse = TRUE, 
+  nav_panel(title = "Intro", 
+            textOutput("intro_text")), 
+  
+  nav_panel(title = "Interactive Plot",
+            sidebarLayout(
+              sidebarPanel(width = 3,
+                           sliderInput(inputId = "shot_dist", label = "Shot Distances", min = 0, max = 45, value = c(0, 45)),
+                           radioButtons(inputId = "location_button", label = "Location: Home-0, Away-1", c("0", "1")),
+                           selectInput("stat1", "Enter a first stat to display (X)", choices = c('shot_number', 'period', 'shot_clock', 'dribbles', 'touch_time', 'shot_dist', 'shot_type', 'def_dist'), "shot_number"),
+                           selectInput("stat2", "Enter a second stat to display (Y)", choices = c('shot_number', 'period', 'shot_clock', 'dribbles', 'touch_time', 'shot_dist', 'shot_type', 'def_dist'), "period")
+                           ),
+              mainPanel(width = 9,
+                        "The following statistics are available to plot: shot_number (shot number for that player in that game), period (quarter), shot_clock (how much time was left on the shot clock), dribbles (how many dribbles the player took before the shot), touch_time (how long the player had the ball for before the shot), shot_dist (how far the shot was from the basket), shot_type (two-pointer or three-pointer), and def_dist (distance away from the closest defender). The scatterplot is colored by made and missed shots. If a point looks like a different color, it means multiple shots were taken at the same values for the specified metric and they had different outcomes.",
+                        plotlyOutput("plot"))
+            )),
+  
+  nav_panel(title = "Data Table",
+            sidebarLayout(
+              sidebarPanel(width = 3,
+                           selectInput("player_name", "Select a player to filter the table by:", 
+                                       choices = c("anthony davis", "james harden", "demarcus cousins", "lebron james", "stephen curry", "chris paul", "blake griffin", "lamarcus aldridge", "pau gasol", "john wall", "carmelo anthony", "nikola vucevic", "damian lillard", "kyrie irving", "rudy gay", "marc gasol", "kobe bryant", "jimmy butler"))
+                           ),
+              mainPanel(width = 9,
+                        "Filter this data table by player name, using the drop-down menu on the left. You can filter the data by the top 20 players, excluding Russel Westbrook and Kevin Durant (there was no data on them)")
+            ),
+            DTOutput("table")),
+  
+  nav_panel(title = "KNN",
+            sidebarLayout(
+              sidebarPanel(width = 0),
+              mainPanel(            
+            plotOutput("selecting_k", width = "400px"),
+            textOutput("analysis1"),
+            plotOutput("conf_mat", width = "400px"),
+            textOutput("analysis2"),
+            plotOutput("roc_curve", width = "400px"),
+            textOutput("analysis3"))
+            )
+), 
+  
+  nav_panel(title = "Analysis",
+            textOutput("analysis_text")),
+  
+  nav_spacer(),
+  nav_menu(
+    title = "Links", 
+    align = "right",
+    nav_item(tags$a("Dataset", href = "https://www.kaggle.com/datasets/dansbecker/nba-shot-logs/data")),
+    nav_item(tags$a("ESPN Players", href = "https://www.espn.com/nba/seasonleaders/_/year/2015"))
+  ) # Create a menu to store links such as the dataset
+)
+
+
+```
+
+```{r}
+server <- function(input, output){
+  
+  
+  output$intro_text <- renderText({
+    paste("The National Basketball Association (NBA) sees thousands of shot attempts per year. Choosing high-value shot attempts is a very valuable skill for a basketball player, and can make the difference between a good and a great player. I utilized the k-nearest neighbors algorithm to predict shot makes for the top 20 players from the 2014-2015 NBA season. These predictions were based on variables like home vs. away games, shot number for that game, period/quarter of the game, shot clock time, number of dribbles before the shot was taken, time the player had the ball, distance from the basket, whether the shot was a 2 or a 3-pointer, and closest defender distance.",
+          
+          "The data for this analysis was taken from Kaggle, and linked in the top right. It contains NBA shot data from the 2014-2015 season, and I filtered it for the top 20 players in 2014-2015, based on ESPN. These ESPN rankings are also linked in the top right. ")
+  })
+  
+  
+  
+  
+# Filter the data for the plot based on the user applied inputs
+  plot_data <- reactive({
+    subset(shot_data, 
+           shot_dist >= input$shot_dist[1] & shot_dist <= input$shot_dist[2] &
+           location == input$location_button)
+  })
+  
+  
+# Interactive Plotly graph using the filtered data based on the user inputs
+  output$plot <- renderPlotly({
+      plot_ly(data = plot_data(),
+            x = ~.data[[input$stat1]],
+            y = ~.data[[input$stat2]],
+            color = ~shot_result,
+            colors = "Set1",
+            type = 'scatter',
+            opacity = 0.9,
+            mode = 'markers',
+            text = ~paste("Player:", player)) %>%
+            layout(title = "Scatterplot",
+               xaxis = list(title = input$stat1),
+               yaxis = list(title = input$stat2))
+    })
+  
+  
+  
+  table_data <- reactive({
+    shot_data %>% 
+      filter(player == input$player_name) %>% 
+        select(location, shot_number, period, shot_clock, dribbles, touch_time, shot_dist, shot_type, def_dist, shot_result)
+  })
+  
+  
+
+  output$table <- renderDataTable({
+        table_data() %>% 
+          datatable(fillContainer = FALSE, options = list(pageLength = 100, scrollY = '400px', scrollX = '400px'))
+    })
+
+  
+  
+  
+  output$selecting_k <- renderPlot({
+    cv_metrics <- collect_metrics(knn_fit)
+    cv_metrics %>% 
+      group_by(.metric) %>% 
+      mutate(.metric = as.factor(.metric)) %>%
+      select(neighbors, .metric, mean) %>% 
+      ggplot(aes(x = neighbors, y = mean, color = forcats::fct_reorder2(.metric, neighbors, mean))) +
+      geom_line(size = 1) +
+      geom_point(size = 2) +
+      theme_minimal() +
+      scale_color_wsj() + 
+      scale_x_continuous(breaks = k_vals[[1]]) +
+      theme(panel.grid.minor.x = element_blank())+
+      labs(color='Metric', y = "Estimate", x = "K")
+  })
+  
+  
+  output$analysis1 <- renderText({
+    "The above plot is used to determine the optimal k value for my knn algorithm. I chose k = 40 to maximize specificity in my model. In my opinion, specificity is more important than sensitivity in the context of predicting NBA shot makes and misses. If you can correctly predict a shot will miss, you can then make a better decision about what to do. Instead of shooting at that moment, you can choose to pass or dribble somewhere else and shoot. "
+  })
+  
+  
+  
+  
+  output$conf_mat <- renderPlot({
+    conf_mat(shot_results, truth = shot_result, estimate = predicted) %>%
+      autoplot()
+  }, height = "auto", width = "auto", res = 100)
+  
+  
+  
+  output$analysis2 <- renderText({
+    
+    "The above plot is a confusion matrix for my initial knn predictions. As you can see, the predicted number of shot makes compared to the total number of shots made (sensitivity) is not super high (slightly below 50%). The predicted number of shots missed compared to the total number of shots missed (specificity) is relatively high (just below 70%)."
+  })
+  
+  
+  
+
+  output$roc_curve <- renderPlot({
+    shot_prob <- predict(shot_fit, test_features, type = "prob")
+    shot_results2 <- shot_test %>% select(shot_result) %>% bind_cols(shot_prob)
+    shot_results2 %>%
+      roc_curve(truth = shot_result, .pred_made) %>%
+      ggplot(aes(x = 1 - specificity, y = sensitivity)) +
+      geom_line(color = "#1f77b4", size = 1.2) +
+      geom_abline(linetype = "dashed", color = "gray") +
+      annotate("text", x = 0.8, y = 0.1, label = paste("AUC =", round(roc_auc(shot_results2, truth = shot_result, .pred_made)$.estimate, 3)), hjust = 1, color = "#ff7f0e", fontface = "bold") +
+      labs(title = "ROC Curve", subtitle = "Performance of Shot Prediction Model", x = "False Positive Rate (1 - specificity)", y = "True Positive Rate (sensitivity)") +
+      theme_minimal() 
+  })
+  
+  
+  output$analysis3 <- renderText({
+    "The area under an ROC curve (AUC) generally tells us how our model performs at varying classification levels. Maximizing the AUC is generally better, as higher AUC values signify a better-performing model. The AUC of my predictive model is only 0.607, so there's still work to be done. Next steps to maximize this area might be being more selective with the variables I use to predict shot makes and misses, or using a larger dataset to try and view larger, more general trends."
+  })
+  
+  
+  
+  output$analysis_text <- renderText({
+    "I was most interested in looking at the relationships between shot distance versus shot clock, shot number versus shot distance, and defender distance versus shot type. Looking at the scatterplot of all shot distances, I found a few outliers and a slight trend that I expected. Intuitively, I thought the shot distance would increase as the shot clock decreased. I found this to be the case, as the largest shot distances all came at a very low shot clock with the exception of Kyrie Irving's shot at a distance of 43.3 feet with 21.6 seconds left on the shot clock. In observing the scatter between these two variables, you can see a slight negative trend at high shot distances and low shot clock values. Looking at the scatter of shot number (X) versus shot distance (Y), I don't see any super visible trends. There are a few trends outside of the main bulk of the scatter, however. I found that at low shot number counts, there were visibly more very high shot distance outliers, which makes sense. As a player shoots more, they get tired, and tend to take shots closer to the basket. Finally, I looked at defender distance (X) versus shot type (Y). There were significantly more makes when shooting a two-pointer and the defender was farther away. Using the k-nearest neighbors algorithm, I was able to obtain predictions for NBA shot makes and misses in the 2014-2015 season. I chose a k value of 40 in order to maximize specificity, the ratio of correctly predicted misses over total actual misses. A high specificity in this context would allow teams to better understand when to shoot and when to do something else such as pass or dribble. Using the available data from the 2014-2015 season, my model correctly predicted 71.7% of misses. To expand on these predictions in the future, I would like to refine my model to only include the most important predictors and use a larger dataset to base my predictions on."
+    
+  })
+  
+  
+  
+}
+```
+
+```{r}
+# Run the app
+shinyApp(ui = ui, server = server, options = list(height = 800))
+```
+
+
